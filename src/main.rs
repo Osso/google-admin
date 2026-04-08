@@ -113,8 +113,9 @@ const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
 fn default_client_id() -> String {
-    std::env::var("GOOGLE_CLIENT_ID")
-        .unwrap_or_else(|_| "690797697044-6kpkd2ethnsren8m5v27qdkj2182eb4n.apps.googleusercontent.com".into())
+    std::env::var("GOOGLE_CLIENT_ID").unwrap_or_else(|_| {
+        "690797697044-6kpkd2ethnsren8m5v27qdkj2182eb4n.apps.googleusercontent.com".into()
+    })
 }
 
 fn default_client_secret() -> String {
@@ -208,7 +209,8 @@ async fn do_oauth_login(config: &mut Config) -> Result<()> {
 
     println!("Authorization code received, exchanging for token...");
 
-    let token_resp = exchange_code_for_tokens(client_id, client_secret, &code, &redirect_uri).await?;
+    let token_resp =
+        exchange_code_for_tokens(client_id, client_secret, &code, &redirect_uri).await?;
 
     config.access_token = token_resp["access_token"].as_str().map(String::from);
     config.refresh_token = token_resp["refresh_token"].as_str().map(String::from);

@@ -112,19 +112,72 @@ const SCOPES: &str = "https://www.googleapis.com/auth/admin.directory.user.reado
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
-// Default OAuth client (same as gmail-cli)
-const DEFAULT_CLIENT_ID: &str =
-    "690797697044-6kpkd2ethnsren8m5v27qdkj2182eb4n.apps.googleusercontent.com";
-const DEFAULT_CLIENT_SECRET: &str = "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";
+fn default_client_id() -> String {
+    std::env::var("GOOGLE_CLIENT_ID")
+        .unwrap_or_else(|_| "690797697044-6kpkd2ethnsren8m5v27qdkj2182eb4n.apps.googleusercontent.com".into())
+}
+
+fn default_client_secret() -> String {
+    std::env::var("GOOGLE_CLIENT_SECRET")
+        .unwrap_or_else(|_| "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".into())
+}
+
+fn receive_oauth_code(server: &tiny_http::Server) -> Result<String> {
+    let request = server
+        .recv()
+        .map_err(|e| anyhow!("Failed to receive callback: {}", e))?;
+    let url = request.url().to_string();
+
+    let code = url
+        .split('?')
+        .nth(1)
+        .and_then(|q| {
+            q.split('&')
+                .find(|p| p.starts_with("code="))
+                .map(|p| p.trim_start_matches("code=").to_string())
+        })
+        .ok_or_else(|| anyhow!("No authorization code in callback"))?;
+
+    let response =
+        tiny_http::Response::from_string("Authorization successful! You can close this window.");
+    let _ = request.respond(response);
+
+    Ok(code)
+}
+
+async fn exchange_code_for_tokens(
+    client_id: &str,
+    client_secret: &str,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<serde_json::Value> {
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(TOKEN_URL)
+        .form(&[
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("code", code),
+            ("grant_type", "authorization_code"),
+            ("redirect_uri", redirect_uri),
+        ])
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await?;
+        bail!("Token exchange failed: {}", body);
+    }
+
+    Ok(resp.json().await?)
+}
 
 async fn do_oauth_login(config: &mut Config) -> Result<()> {
-    let client_id = config.client_id.as_deref().unwrap_or(DEFAULT_CLIENT_ID);
-    let client_secret = config
-        .client_secret
-        .as_deref()
-        .unwrap_or(DEFAULT_CLIENT_SECRET);
+    let default_id = default_client_id();
+    let default_secret = default_client_secret();
+    let client_id = config.client_id.as_deref().unwrap_or(&default_id);
+    let client_secret = config.client_secret.as_deref().unwrap_or(&default_secret);
 
-    // Start local server on dynamic port to receive callback
     let server = tiny_http::Server::http("127.0.0.1:0")
         .map_err(|e| anyhow!("Failed to start callback server: {}", e))?;
     let port = server
@@ -151,49 +204,11 @@ async fn do_oauth_login(config: &mut Config) -> Result<()> {
 
     println!("Waiting for authorization...");
 
-    let request = server
-        .recv()
-        .map_err(|e| anyhow!("Failed to receive callback: {}", e))?;
-    let url = request.url().to_string();
-
-    // Extract code from callback
-    let code = url
-        .split('?')
-        .nth(1)
-        .and_then(|q| {
-            q.split('&')
-                .find(|p| p.starts_with("code="))
-                .map(|p| p.trim_start_matches("code=").to_string())
-        })
-        .ok_or_else(|| anyhow!("No authorization code in callback"))?;
-
-    // Send response to browser
-    let response =
-        tiny_http::Response::from_string("Authorization successful! You can close this window.");
-    let _ = request.respond(response);
+    let code = receive_oauth_code(&server)?;
 
     println!("Authorization code received, exchanging for token...");
 
-    // Exchange code for tokens
-    let http = reqwest::Client::new();
-    let resp = http
-        .post(TOKEN_URL)
-        .form(&[
-            ("client_id", client_id),
-            ("client_secret", client_secret),
-            ("code", &code),
-            ("grant_type", "authorization_code"),
-            ("redirect_uri", &redirect_uri),
-        ])
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let body = resp.text().await?;
-        bail!("Token exchange failed: {}", body);
-    }
-
-    let token_resp: serde_json::Value = resp.json().await?;
+    let token_resp = exchange_code_for_tokens(client_id, client_secret, &code, &redirect_uri).await?;
 
     config.access_token = token_resp["access_token"].as_str().map(String::from);
     config.refresh_token = token_resp["refresh_token"].as_str().map(String::from);
@@ -209,11 +224,10 @@ async fn do_oauth_login(config: &mut Config) -> Result<()> {
 }
 
 async fn refresh_token(config: &mut Config) -> Result<()> {
-    let client_id = config.client_id.as_deref().unwrap_or(DEFAULT_CLIENT_ID);
-    let client_secret = config
-        .client_secret
-        .as_deref()
-        .unwrap_or(DEFAULT_CLIENT_SECRET);
+    let default_id = default_client_id();
+    let default_secret = default_client_secret();
+    let client_id = config.client_id.as_deref().unwrap_or(&default_id);
+    let client_secret = config.client_secret.as_deref().unwrap_or(&default_secret);
     let refresh_token = config
         .refresh_token
         .as_ref()
@@ -350,6 +364,76 @@ fn print_users(value: &serde_json::Value) {
     }
 }
 
+async fn handle_config(
+    config: &mut Config,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    domain: Option<String>,
+) -> Result<()> {
+    if client_id.is_none() && client_secret.is_none() && domain.is_none() {
+        println!("Current configuration:");
+        println!(
+            "  client_id: {}",
+            config.client_id.as_deref().unwrap_or("(not set)")
+        );
+        println!(
+            "  client_secret: {}",
+            config
+                .client_secret
+                .as_ref()
+                .map(|_| "***")
+                .unwrap_or("(not set)")
+        );
+        println!(
+            "  domain: {}",
+            config.domain.as_deref().unwrap_or("(not set)")
+        );
+        return Ok(());
+    }
+    if let Some(id) = client_id {
+        config.client_id = Some(id);
+    }
+    if let Some(secret) = client_secret {
+        config.client_secret = Some(secret);
+    }
+    if let Some(d) = domain {
+        config.domain = Some(d);
+    }
+    config.save()?;
+    println!("Configuration saved.");
+    Ok(())
+}
+
+async fn handle_auth_status(config: &Config) -> Result<()> {
+    if config.access_token.is_some() {
+        println!("Authenticated");
+        if let Some(exp) = config.expires_at {
+            let dt = chrono::DateTime::from_timestamp(exp, 0)
+                .map(|d| d.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            println!("  expires: {}", dt);
+            println!("  expired: {}", config.is_expired());
+        }
+    } else {
+        println!("Not authenticated");
+    }
+    Ok(())
+}
+
+async fn handle_users_list(config: &mut Config, limit: u32, query: Option<String>) -> Result<()> {
+    let client = get_client(config).await?;
+    let result = client.list_users(limit, query.as_deref()).await?;
+    print_users(&result);
+    Ok(())
+}
+
+async fn handle_users_get(config: &mut Config, user: String) -> Result<()> {
+    let client = get_client(config).await?;
+    let result = client.get_user(&user).await?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -360,71 +444,18 @@ async fn main() -> Result<()> {
             client_id,
             client_secret,
             domain,
-        } => {
-            if client_id.is_none() && client_secret.is_none() && domain.is_none() {
-                println!("Current configuration:");
-                println!(
-                    "  client_id: {}",
-                    config.client_id.as_deref().unwrap_or("(not set)")
-                );
-                println!(
-                    "  client_secret: {}",
-                    config
-                        .client_secret
-                        .as_ref()
-                        .map(|_| "***")
-                        .unwrap_or("(not set)")
-                );
-                println!(
-                    "  domain: {}",
-                    config.domain.as_deref().unwrap_or("(not set)")
-                );
-                return Ok(());
-            }
-            if let Some(id) = client_id {
-                config.client_id = Some(id);
-            }
-            if let Some(secret) = client_secret {
-                config.client_secret = Some(secret);
-            }
-            if let Some(d) = domain {
-                config.domain = Some(d);
-            }
-            config.save()?;
-            println!("Configuration saved.");
-        }
+        } => handle_config(&mut config, client_id, client_secret, domain).await?,
 
         Commands::Auth { command } => match command {
-            AuthCommands::Login => {
-                do_oauth_login(&mut config).await?;
-            }
-            AuthCommands::Status => {
-                if config.access_token.is_some() {
-                    println!("Authenticated");
-                    if let Some(exp) = config.expires_at {
-                        let dt = chrono::DateTime::from_timestamp(exp, 0)
-                            .map(|d| d.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                            .unwrap_or_else(|| "unknown".to_string());
-                        println!("  expires: {}", dt);
-                        println!("  expired: {}", config.is_expired());
-                    }
-                } else {
-                    println!("Not authenticated");
-                }
-            }
+            AuthCommands::Login => do_oauth_login(&mut config).await?,
+            AuthCommands::Status => handle_auth_status(&config).await?,
         },
 
         Commands::Users { command } => match command {
             UserCommands::List { limit, query } => {
-                let client = get_client(&mut config).await?;
-                let result = client.list_users(limit, query.as_deref()).await?;
-                print_users(&result);
+                handle_users_list(&mut config, limit, query).await?
             }
-            UserCommands::Get { user } => {
-                let client = get_client(&mut config).await?;
-                let result = client.get_user(&user).await?;
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            }
+            UserCommands::Get { user } => handle_users_get(&mut config, user).await?,
         },
     }
 
